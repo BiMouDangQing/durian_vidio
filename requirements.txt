@@ -1,0 +1,14 @@
+numpy
+scipy
+scikit-learn
+librosa
+soundfile
+matplotlib
+joblib
+tqdm
+lightgbm
+pandas
+pyqtgraph
+PySide6
+torch
+torchvision
