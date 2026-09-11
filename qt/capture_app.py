@@ -80,13 +80,22 @@ except Exception:
 # 确保 fqb 目录在 sys.path(以便 from qt.mainwindow import MainWindow)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# conda 环境下 pip 装的 PySide6 无法自动定位 Qt 插件, 显式设置 QT_PLUGIN_PATH
+import PySide6 as _pyside6
+_qt_plugins = os.path.join(os.path.dirname(_pyside6.__file__), "plugins")
+if os.path.isdir(_qt_plugins):
+    os.environ.setdefault("QT_PLUGIN_PATH", _qt_plugins)
+
 from PySide6 import QtWidgets
 from qt.mainwindow import MainWindow
+from qt.theme import QSS, APP_TITLE
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(QSS)
     w = MainWindow()
+    w.setWindowTitle(APP_TITLE)
     w.show()
     sys.exit(app.exec())
 

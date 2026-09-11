@@ -6,9 +6,11 @@ import datetime
 
 import numpy as np
 import pandas as pd
+import joblib
+import threading
 
 from PySide6 import QtWidgets
-from PySide6.QtCore import QIODevice, QTimer, QThread, Qt
+from PySide6.QtCore import QIODevice, QTimer, QThread, Qt, Signal, QSettings
 from PySide6.QtMultimedia import QAudioInput, QAudioFormat, QMediaDevices
 
 from qt.audio import AudioBuffer
@@ -42,21 +44,36 @@ HISTORY_FRAMES = 200
 
 
 class TrainThread(QThread):
-    """后台训练线程, 避免阻塞 UI。"""
+    """后台训练线程, 避免阻塞 UI, 支持暂停/继续。"""
+
+    progress = Signal(int, int, int, int, float, float)   # epoch, total, batch_done, batch_total, loss, acc
 
     def __init__(self, module):
         super().__init__()
         self.module = module
         self.error = None
         self.log_text = ""
+        self.pause_event = threading.Event()
+        self.pause_event.set()   # 初始为运行状态
 
     def run(self):
         import io
+        import inspect
         from contextlib import redirect_stdout
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
-                self.module.main()
+                try:
+                    sig = inspect.signature(self.module.main).parameters
+                except Exception:
+                    sig = {}
+                kwargs = {}
+                if "progress_callback" in sig:
+                    kwargs["progress_callback"] = (lambda ep, tot, bd, bt, loss, acc:
+                                                   self.progress.emit(ep, tot, bd, bt, loss, acc))
+                if "pause_event" in sig:
+                    kwargs["pause_event"] = self.pause_event
+                self.module.main(**kwargs)
             self.log_text = buf.getvalue()
         except Exception as e:
             self.error = e
@@ -79,6 +96,13 @@ class MainWindow(QtWidgets.QWidget):
         self.preview_list = []   # [(文件名, 信号数组)]
         self.preview_idx = -1
         self._ds_error = None    # Deep Spectrum 首次失败后不再重试
+        # 预测: 已加载模型
+        self.loaded_model = None
+        self.loaded_model_type = None    # 'lgbm' / 'dl'
+        self.loaded_model_device = None
+        # 训练曲线数据
+        self._train_losses = []
+        self._train_accs = []
 
         n_freq = N_FFT // 2 + 1
         self.spec_history = np.zeros((n_freq, HISTORY_FRAMES))
@@ -91,6 +115,13 @@ class MainWindow(QtWidgets.QWidget):
         if T is not None:
             self.edit_train_dir.setText(getattr(T.config, "DATA_PATH", ""))
             self.edit_label_file.setText(getattr(T.config, "LABEL_PATH", ""))
+
+        # 记忆历史路径(模型/数据集/训练目录)
+        self.settings = QSettings("reemoon", "durian_vidio")
+        self._restore_settings()
+        # 预测数据集目录默认使用训练数据目录
+        if T is not None and not self.edit_pred_dir.text().strip():
+            self.edit_pred_dir.setText(getattr(T.config, "DATA_PATH", ""))
 
         self.timer = QTimer(self)
         self.timer.setInterval(50)
@@ -135,6 +166,19 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_stop.setEnabled(False)
         self.lbl_status.setText("已停止")
 
+    def _restore_settings(self):
+        """恢复历史路径设置。"""
+        for attr, key in [
+            ("edit_model_path", "predict/model_path"),
+            ("edit_pred_dir", "predict/data_dir"),
+            ("edit_train_dir", "train/data_dir"),
+            ("edit_label_file", "train/label_file"),
+            ("edit_train_out", "train/out_dir"),
+        ]:
+            val = self.settings.value(key, "")
+            if val and hasattr(self, attr):
+                getattr(self, attr).setText(val)
+
     def _browse_data_dir(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(
             self, "选择数据保存目录", self.edit_data_dir.text())
@@ -146,17 +190,46 @@ class MainWindow(QtWidgets.QWidget):
             self, "选择训练数据目录", self.edit_train_dir.text())
         if d:
             self.edit_train_dir.setText(d)
+            self.settings.setValue("train/data_dir", d)
 
     def _browse_label_file(self):
         f, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "选择标签文件", self.edit_label_file.text(), "CSV (*.csv)")
         if f:
             self.edit_label_file.setText(f)
+            self.settings.setValue("train/label_file", f)
+
+    def _browse_train_out(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择结果保存目录", self.edit_train_out.text())
+        if d:
+            self.edit_train_out.setText(d)
+            self.settings.setValue("train/out_dir", d)
 
     def _train_model(self):
         if T is None:
             QtWidgets.QMessageBox.warning(self, "错误", "无法导入训练模块 train.py")
             return
+        # 根据「模型」下拉框选择训练模块与框架
+        module = T
+        try:
+            model_type = self.combo_model.currentData()
+        except Exception:
+            model_type = "lgbm"
+        if model_type != "lgbm":
+            try:
+                from train import dl_train as DL
+            except ImportError:
+                import train.dl_train as DL
+            module = DL
+            # 把界面上的深度学习参数写入 dl_train 模块
+            try:
+                DL.MODEL_TYPE = model_type
+                DL.EPOCHS = self.spin_dl_epochs.value()
+                DL.BATCH_SIZE = self.spin_dl_batch.value()
+                DL.LR = self.spin_dl_lr.value()
+            except Exception:
+                pass
         data_dir = self.edit_train_dir.text().strip()
         label_file = self.edit_label_file.text().strip()
         if not data_dir or not os.path.isdir(data_dir):
@@ -168,19 +241,49 @@ class MainWindow(QtWidgets.QWidget):
         T.config.DATA_PATH = data_dir
         T.config.LABEL_PATH = label_file
         T.config.RUN_TIME = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        T.config.OUTPUT_DIR = os.path.join(
+        # 测试集比例
+        try:
+            T.config.TEST_SIZE = self.spin_test_size.value()
+        except Exception:
+            pass
+        # 结果保存路径(用户可指定, 留空则按时间戳归档)
+        out_dir = self.edit_train_out.text().strip()
+        T.config.OUTPUT_DIR = out_dir or os.path.join(
             T.PROJECT_ROOT, "results", "train", T.config.RUN_TIME)
-        T.config.MODEL_PATH = os.path.join(T.config.OUTPUT_DIR, "model.pkl")
+        os.makedirs(T.config.OUTPUT_DIR, exist_ok=True)
+        # 模型文件名体现训练方法/框架
+        if module is T:
+            model_name = "model_lgbm.pkl"
+        else:
+            model_name = f"model_{getattr(module, 'MODEL_TYPE', 'cnn14')}.pt"
+        T.config.MODEL_PATH = os.path.join(T.config.OUTPUT_DIR, model_name)
         T.config.VAL_RESULT_PATH = os.path.join(T.config.OUTPUT_DIR, "val_result.csv")
+        # wandb 开关(仅深度学习训练生效)
+        if module is not T:
+            try:
+                module.USE_WANDB = self.chk_use_wandb.isChecked()
+            except Exception:
+                pass
         self.btn_train.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("暂停训练")
         self.lbl_status.setText("模型训练中, 请稍候...")
         self.txt_train_log.setPlainText("训练中, 请稍候...\n")
-        self._train_thread = TrainThread(T)
+        self.progress_train.setValue(0)
+        self.progress_train_epoch.setValue(0)
+        self._train_losses = []
+        self._train_accs = []
+        self.plot_train_loss.clear()
+        self.plot_train_acc.clear()
+        self._train_thread = TrainThread(module)
+        self._train_thread.progress.connect(self._on_train_progress)
         self._train_thread.finished.connect(self._on_train_done)
         self._train_thread.start()
 
     def _on_train_done(self):
         self.btn_train.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("暂停训练")
         t = self._train_thread
         if getattr(t, "log_text", ""):
             self.txt_train_log.setPlainText(t.log_text)
@@ -189,12 +292,53 @@ class MainWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "训练失败", str(t.error))
         else:
             self.lbl_status.setText("训练完成")
+            self.progress_train.setValue(100)
             QtWidgets.QMessageBox.information(
                 self, "训练完成", f"模型已保存:\n{t.module.config.MODEL_PATH}")
             self._plot_train_metrics()
 
+    def _on_train_progress(self, epoch, total, batch_done, batch_total, loss, acc):
+        self.progress_train.setValue(int(epoch / max(total, 1) * 100))
+        if batch_total:
+            self.progress_train_epoch.setValue(int(batch_done / max(batch_total, 1) * 100))
+        if acc is not None:
+            self.lbl_status.setText(f"训练中... {epoch}/{total} (测试 acc {acc:.4f})")
+            self._train_accs.append(acc)
+            self._update_train_curves()
+        else:
+            self.lbl_status.setText(f"训练中... 第 {epoch}/{total} 轮, batch {batch_done}/{batch_total}")
+            if loss is not None:
+                self._train_losses.append(loss)
+                self._update_train_curves()
+
+    def _toggle_pause(self):
+        """暂停/继续训练。"""
+        t = getattr(self, "_train_thread", None)
+        if t is None or not t.isRunning():
+            return
+        if t.pause_event.is_set():
+            t.pause_event.clear()
+            self.btn_pause.setText("继续训练")
+            self.lbl_status.setText("训练已暂停")
+        else:
+            t.pause_event.set()
+            self.btn_pause.setText("暂停训练")
+            self.lbl_status.setText("训练继续中...")
+
+    def _update_train_curves(self):
+        """实时更新训练 loss 与 acc 曲线(增量 setData, 避免重绘卡顿)。"""
+        if self._train_losses:
+            self.curve_train_loss.setData(list(range(len(self._train_losses))), self._train_losses)
+        if self._train_accs:
+            self.curve_train_acc.setData(list(range(1, len(self._train_accs) + 1)), self._train_accs)
+
     def _plot_train_metrics(self):
-        """训练完成后, 从 val_result.csv 画各样本预测分数散点(按真实类别着色)。"""
+        """训练完成后, 从 val_result.csv 画各样本预测散点(按真实类别着色)。
+
+        兼容两种格式:
+        - LightGBM 回归: 有 score 列, 画连续分数 + 阈值线;
+        - 深度学习分类: 有 pred_class 列, 画预测类别。
+        """
         import pyqtgraph as pg
         val_path = T.config.VAL_RESULT_PATH if T is not None else ""
         if not val_path or not os.path.isfile(val_path):
@@ -203,16 +347,30 @@ class MainWindow(QtWidgets.QWidget):
             df = pd.read_csv(val_path)
             self.plot_train_metrics.clear()
             colors = {1: "g", 2: "y", 3: "r"}
-            for cls in [1, 2, 3]:
-                sub = df[df["true_class"] == cls]
-                if len(sub):
-                    name = T.CLASS_NAMES.get(cls, str(cls))
-                    self.plot_train_metrics.plot(
-                        sub.index.values, sub["score"].values, pen=None, symbol="o",
-                        symbolBrush=colors[cls], symbolSize=8, name=name)
-            for th in [T.config.THRESH_1_2, T.config.THRESH_2_3]:
-                self.plot_train_metrics.addLine(
-                    y=th, pen=pg.mkPen("gray", style=Qt.DashLine))
+            if "score" in df.columns:
+                # LightGBM 回归: 连续分数散点 + 阈值线
+                self.plot_train_metrics.setTitle("测试集各样本预测分数(按真实类别着色)")
+                for cls in [1, 2, 3]:
+                    sub = df[df["true_class"] == cls]
+                    if len(sub):
+                        name = T.CLASS_NAMES.get(cls, str(cls))
+                        self.plot_train_metrics.plot(
+                            sub.index.values, sub["score"].values, pen=None, symbol="o",
+                            symbolBrush=colors[cls], symbolSize=8, name=name)
+                for th in [T.config.THRESH_1_2, T.config.THRESH_2_3]:
+                    self.plot_train_metrics.addLine(
+                        y=th, pen=pg.mkPen("gray", style=Qt.DashLine))
+            elif "pred_class" in df.columns:
+                # 深度学习分类: 画预测类别
+                self.plot_train_metrics.setTitle("测试集各样本预测类别(按真实类别着色)")
+                for cls in [1, 2, 3]:
+                    sub = df[df["true_class"] == cls]
+                    if len(sub):
+                        name = T.CLASS_NAMES.get(cls, str(cls))
+                        self.plot_train_metrics.plot(
+                            sub.index.values, sub["pred_class"].values, pen=None, symbol="o",
+                            symbolBrush=colors[cls], symbolSize=8, name=name)
+                self.plot_train_metrics.setYRange(0, 4)
         except Exception as e:
             print(f"画训练指标失败: {e}")
 
@@ -490,29 +648,87 @@ class MainWindow(QtWidgets.QWidget):
         self.lbl_preview.setText(f"DS 对比 {show_n}/{n} 条信号")
 
     # ---------- 预测 ----------
-    def _predict_knocks(self, knocks):
-        if not knocks:
-            self.lbl_pred.setText("预测: 无数据")
+    def _load_model_file(self):
+        """加载用户选择的模型文件(LightGBM .pkl 或深度学习 .pt)。"""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择模型文件", "", "模型文件 (*.pkl *.pt)")
+        if not path:
             return
+        self.edit_model_path.setText(path)
+        self.settings.setValue("predict/model_path", path)
+        try:
+            if path.endswith(".pt"):
+                from predict import dl_inference as dl_inf
+                import torch
+                dev = torch.device("cpu") if self.chk_use_cpu.isChecked() else None
+                self.loaded_model, self.loaded_model_device = dl_inf.load_dl_model(path, device=dev)
+                self.loaded_model_type = "dl"
+                self.lbl_model_status.setText(f"已加载深度学习模型({self.loaded_model_device}): {os.path.basename(path)}")
+            else:
+                self.loaded_model = joblib.load(path)
+                self.loaded_model_type = "lgbm"
+                self.lbl_model_status.setText(f"已加载 LightGBM 模型: {os.path.basename(path)}")
+        except Exception as e:
+            self.loaded_model = None
+            self.loaded_model_type = None
+            self.lbl_model_status.setText("模型加载失败")
+            QtWidgets.QMessageBox.warning(self, "错误", f"模型加载失败:\n{e}")
+
+    def _browse_pred_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择预测数据集目录", self.edit_pred_dir.text())
+        if d:
+            self.edit_pred_dir.setText(d)
+            self.settings.setValue("predict/data_dir", d)
+
+    def _predict_knocks_value(self, knocks):
+        """对多条敲击信号预测, 返回类别 int(1/2/3), 失败返回 None。"""
+        if not knocks:
+            return None
+        if self.loaded_model is not None:
+            try:
+                if self.loaded_model_type == "dl":
+                    from predict import dl_inference as dl_inf
+                    return dl_inf.predict_dl(self.loaded_model, knocks,
+                                             self.loaded_model_device)
+                return predictor.predict_class(self.loaded_model, knocks, T)
+            except Exception:
+                return None
+        # 回退: 自动加载最新 LightGBM 模型
         model = predictor.load_model(T)
         if model is None:
-            self.lbl_pred.setText("预测: 无模型")
-            return
+            return None
         try:
-            pred_class = predictor.predict_class(model, knocks, T)
-            name = T.CLASS_NAMES.get(pred_class, str(pred_class))
-            self.lbl_pred.setText(f"预测: {name}({pred_class})")
-        except Exception as e:
-            self.lbl_pred.setText(f"预测失败: {e}")
+            return predictor.predict_class(model, knocks, T)
+        except Exception:
+            return None
+
+    def _predict_knocks(self, knocks):
+        pred = self._predict_knocks_value(knocks)
+        if pred is None:
+            if not knocks:
+                self.lbl_pred.setText("预测: 无数据")
+            else:
+                self.lbl_pred.setText("预测: 无模型")
+            return
+        name = T.CLASS_NAMES.get(pred, str(pred))
+        self.lbl_pred.setText(f"预测: {name}({pred})")
 
     def _predict_and_show(self):
         self._predict_knocks(self.knock_list)
 
     def _predict_manual(self):
-        """手动预测: 有采集数据直接用, 否则选 CSV 文件。"""
+        """手动预测: 数据集目录 > 采集数据 > 单个 CSV。"""
+        # 1. 数据集目录批量预测
+        pred_dir = self.edit_pred_dir.text().strip()
+        if pred_dir and os.path.isdir(pred_dir):
+            self._predict_directory(pred_dir)
+            return
+        # 2. 采集数据
         if self.knock_list:
             self._predict_knocks(self.knock_list)
             return
+        # 3. 单个 CSV
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "选择敲击数据 CSV", self.edit_data_dir.text(), "CSV (*.csv)")
         if not path:
@@ -534,3 +750,157 @@ class MainWindow(QtWidgets.QWidget):
             self._predict_knocks(knocks)
         except Exception as e:
             self.lbl_pred.setText(f"预测失败: {e}")
+
+    def _predict_directory(self, dir_path):
+        """批量预测目录内所有 CSV, 按样本聚合, 对比真实标签并输出准确率。"""
+        # 收集 CSV 文件(兼容 样本ID_位置.csv 与 位置.csv 两种命名)
+        files = []
+        for f in sorted(os.listdir(dir_path)):
+            if not f.endswith(".csv") or "label" in f:
+                continue
+            stem = f[:-4]
+            if "_" in stem and stem.split("_")[0].isdigit():
+                files.append(f)
+            elif stem.isdigit():
+                files.append(f)
+        if not files:
+            all_csv = [f for f in os.listdir(dir_path) if f.endswith(".csv")]
+            if all_csv:
+                msg = (f"目录内有 {len(all_csv)} 个 CSV, 但都不符合命名规则"
+                       f"(需为 样本ID_位置.csv 或 位置.csv)\n例如: {all_csv[:3]}")
+            else:
+                msg = f"目录内没有 CSV 文件:\n{dir_path}"
+            QtWidgets.QMessageBox.warning(self, "提示", msg)
+            return
+
+        def file_sid(f):
+            """从文件名提取样本ID: 021_01.csv -> 21, 02.csv -> 0(单一样本)。"""
+            stem = f[:-4]
+            if "_" in stem and stem.split("_")[0].isdigit():
+                return int(stem.split("_")[0])
+            return 0
+
+        # 读取真实标签(若存在 label.csv)
+        label_map = {}
+        label_path = os.path.join(dir_path, "label.csv")
+        if os.path.isfile(label_path):
+            try:
+                lab = pd.read_csv(label_path, header=None)
+                labels = pd.to_numeric(lab.iloc[:, 0], errors="coerce").dropna().astype(int).values
+                sids = sorted({file_sid(f) for f in files})
+                label_map = {sid: int(lb) for sid, lb in zip(sids, labels[:len(sids)])}
+            except Exception:
+                label_map = {}
+
+        # 按样本聚合信号
+        from collections import defaultdict
+        sample_knocks = defaultdict(list)
+        for f in files:
+            sid = file_sid(f)
+            try:
+                df = pd.read_csv(os.path.join(dir_path, f), header=None)
+                arr = np.nan_to_num(df.values.astype(np.float64),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                arr = arr[np.any(arr != 0, axis=1)]
+                for row in arr[:5]:   # 每文件最多 5 条信号
+                    r = row[:1024] if len(row) >= 1024 else np.pad(row, (0, 1024 - len(row)))
+                    sample_knocks[sid].append(np.asarray(r, dtype=np.float64))
+            except Exception:
+                pass
+
+        if not sample_knocks:
+            QtWidgets.QMessageBox.warning(self, "提示", "目录内没有有效信号")
+            return
+
+        # 统计(样本级 + 信号级 + 每类)
+        class_names = T.CLASS_NAMES
+        sample_total = sample_correct = 0
+        sig_total = sig_correct = 0
+        sample_cls_total = {c: 0 for c in class_names}
+        sample_cls_correct = {c: 0 for c in class_names}
+        sig_cls_total = {c: 0 for c in class_names}
+        sig_cls_correct = {c: 0 for c in class_names}
+
+        rows = []
+        sids_sorted = sorted(sample_knocks.keys())
+        n_samples = len(sids_sorted)
+        self.progress_predict.setValue(0)
+        for idx, sid in enumerate(sids_sorted):
+            knocks = sample_knocks[sid]
+            true = label_map.get(sid)
+            pred = self._predict_knocks_value(knocks)
+            mark = ""
+            if pred is not None and true is not None:
+                sample_total += 1
+                sample_cls_total[true] = sample_cls_total.get(true, 0) + 1
+                if pred == true:
+                    sample_correct += 1
+                    sample_cls_correct[true] = sample_cls_correct.get(true, 0) + 1
+                    mark = "√"
+                else:
+                    mark = "×"
+            # 信号级: 每条敲击信号单独预测
+            if true is not None:
+                for x in knocks:
+                    sp = self._predict_knocks_value([x])
+                    if sp is not None:
+                        sig_total += 1
+                        sig_cls_total[true] = sig_cls_total.get(true, 0) + 1
+                        if sp == true:
+                            sig_correct += 1
+                            sig_cls_correct[true] = sig_cls_correct.get(true, 0) + 1
+            rows.append({"样本": sid,
+                         "真实": true if true is not None else "-",
+                         "预测": pred if pred is not None else "无法预测",
+                         "预测名称": T.CLASS_NAMES.get(pred, "-") if pred else "-",
+                         "正确": mark})
+            self.progress_predict.setValue(int((idx + 1) / n_samples * 100))
+            QtWidgets.QCoreApplication.processEvents()
+
+        # 组装报告
+        lines = ["========== 预测报告 =========="]
+        if sample_total:
+            lines.append(f"样本级准确率: {sample_correct}/{sample_total} = {sample_correct/sample_total:.2%}")
+            for c in sorted(class_names):
+                n = sample_cls_total[c]
+                if n:
+                    lines.append(f"  类别{c}({class_names[c]}): {sample_cls_correct[c]}/{n} = {sample_cls_correct[c]/n:.2%}")
+        if sig_total:
+            lines.append(f"信号级准确率: {sig_correct}/{sig_total} = {sig_correct/sig_total:.2%}")
+            for c in sorted(class_names):
+                n = sig_cls_total[c]
+                if n:
+                    lines.append(f"  类别{c}({class_names[c]}): {sig_cls_correct[c]}/{n} = {sig_cls_correct[c]/n:.2%}")
+        if not label_map:
+            lines.append("目录内无 label.csv, 无法计算准确率")
+        lines.append("=" * 28)
+
+        if rows:
+            df_res = pd.DataFrame(rows)
+            report_text = "\n".join(lines) + "\n\n" + df_res.to_string(index=False)
+            self.txt_pred_result.setPlainText(report_text)
+            # 保存预测结果到文档
+            try:
+                out_dir = os.path.join(T.PROJECT_ROOT, "results", "predict",
+                                       datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+                os.makedirs(out_dir, exist_ok=True)
+                df_res.to_csv(os.path.join(out_dir, "predict_result.csv"),
+                              index=False, encoding="utf-8-sig")
+                with open(os.path.join(out_dir, "report.txt"), "w", encoding="utf-8") as fp:
+                    fp.write(report_text)
+                self.txt_pred_result.appendPlainText(
+                    f"\n\n预测结果已保存到:\n{out_dir}\n  - predict_result.csv\n  - report.txt")
+            except Exception as e:
+                self.txt_pred_result.appendPlainText(f"\n\n保存结果失败: {e}")
+        else:
+            self.txt_pred_result.setPlainText("\n".join(lines))
+
+        if sample_total:
+            head = f"样本级 {sample_correct/sample_total:.2%}"
+            if sig_total:
+                head += f" | 信号级 {sig_correct/sig_total:.2%}"
+            self.lbl_pred.setText(f"批量预测完成: {len(sample_knocks)} 个样本 | {head}")
+        else:
+            self.lbl_pred.setText(f"批量预测完成: {len(sample_knocks)} 个样本 | 无标签无法计算准确率")

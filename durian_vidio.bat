@@ -4,7 +4,7 @@ rem Launches the GUI and closes this console window immediately.
 
 cd /d "%~dp0"
 
-set "PY=D:\anaconda\envs\vidio_data\pythonw.exe"
+set "PY=D:\model\model\vidio\.venv\pythonw.exe"
 
 if not exist "%PY%" (
     echo [ERROR] Python not found: %PY%

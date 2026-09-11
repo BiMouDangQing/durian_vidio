@@ -12,6 +12,12 @@ dist/
 logs/
 *.log
 
+# 训练/预测产物
+results/
+
+# wandb 运行日志
+wandb/
+
 # 冗余谱图 PNG(按需从 CSV 生成, 不落盘)
 captured/spectrograms/
 
@@ -21,3 +27,6 @@ venv/
 env/
 .idea/
 .vscode/
+
+# 深度学习预训练权重
+weights/

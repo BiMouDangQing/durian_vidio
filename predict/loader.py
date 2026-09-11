@@ -19,7 +19,10 @@ def load_model(train_module):
         if not root:
             root = os.path.dirname(train_module.__file__)
         cands = sorted(glob.glob(os.path.join(
-            root, "results", "train", "*", "model.pkl")))
+            root, "results", "train", "*", "model_lgbm.pkl")))
+        if not cands:  # 兼容旧命名 model.pkl
+            cands = sorted(glob.glob(os.path.join(
+                root, "results", "train", "*", "model.pkl")))
         if not cands:
             return None
         return joblib.load(cands[-1])

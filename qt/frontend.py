@@ -21,9 +21,14 @@ sys.path.insert(0, str(ROOT))
 
 from tools import spectrogram  # noqa: E402
 from mainwindow import MainWindow as CaptureTool  # noqa: E402
+from theme import QSS, BRAND, APP_TITLE  # noqa: E402
 
 # 兼容 PySide6 与 PyQt5
 try:
+    import PySide6
+    _qt_plugins = os.path.join(os.path.dirname(PySide6.__file__), "plugins")
+    if os.path.isdir(_qt_plugins):
+        os.environ.setdefault("QT_PLUGIN_PATH", _qt_plugins)
     from PySide6 import QtCore, QtGui, QtWidgets
     QT_LIB = "PySide6"
 except ImportError:  # pragma: no cover
@@ -49,11 +54,30 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("音频数据处理工具 - 前端")
-        self.resize(760, 560)
+        self.resize(1000, 720)
+        self.setMinimumSize(900, 640)
         self._build_ui()
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
+        # 品牌横幅(logo + 文字)
+        brand_bar = QtWidgets.QFrame()
+        brand_bar.setObjectName("brandBar")
+        brand_layout = QtWidgets.QHBoxLayout(brand_bar)
+        brand_layout.setContentsMargins(16, 6, 16, 6)
+        # 公司 logo
+        logo_label = QtWidgets.QLabel()
+        logo_path = str(ROOT / "lg.png")
+        if os.path.exists(logo_path):
+            pm = QtGui.QPixmap(logo_path)
+            if not pm.isNull():
+                logo_label.setPixmap(pm.scaledToHeight(40, QtCore.Qt.SmoothTransformation))
+        brand_layout.addWidget(logo_label)
+        # 品牌文字
+        self.brand_label = QtWidgets.QLabel(f"{BRAND} · 榴莲声学成熟度分析")
+        self.brand_label.setAlignment(QtCore.Qt.AlignCenter)
+        brand_layout.addWidget(self.brand_label, stretch=1)
+        layout.addWidget(brand_bar)
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs)
         self.tabs.addTab(self._build_clean_tab(), "音频清洗")
@@ -170,10 +194,14 @@ class MainWindow(QtWidgets.QWidget):
         form.addRow("输出目录:", row_out)
         layout.addLayout(form)
 
-        # 转换按钮
+        # 转换按钮 + 进度条
         self.btn_spec_run = QtWidgets.QPushButton("开始转换")
         self.btn_spec_run.clicked.connect(self.run_spectrogram)
         layout.addWidget(self.btn_spec_run)
+        self.progress_spec = QtWidgets.QProgressBar()
+        self.progress_spec.setRange(0, 100)
+        self.progress_spec.setValue(0)
+        layout.addWidget(self.progress_spec)
 
         # 预览导航
         nav = QtWidgets.QHBoxLayout()
@@ -317,12 +345,14 @@ class MainWindow(QtWidgets.QWidget):
         self._img_index = -1
         self._spec_log(f"开始转换 {len(paths)} 个文件，类型={kind}，采样率={sr}")
         self.btn_spec_run.setEnabled(False)
+        self.progress_spec.setValue(0)
 
         results = []
         for i, p in enumerate(paths):
             self._spec_log(f"[{i + 1}/{len(paths)}] {Path(p).name}")
             r = spectrogram.process_file(p, out_dir, kind=kind, sr=sr)
             results.append(r)
+            self.progress_spec.setValue(int((i + 1) / len(paths) * 100))
             if r["ok"]:
                 for png in r["outputs"].values():
                     self._images.append(png)
@@ -382,7 +412,9 @@ class MainWindow(QtWidgets.QWidget):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(QSS)
     win = MainWindow()
+    win.setWindowTitle(APP_TITLE)
     win.show()
     sys.exit(app.exec())
 

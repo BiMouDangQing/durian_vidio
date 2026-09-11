@@ -11,8 +11,8 @@ import datetime
 # ================== 路径与输出 ==================
 SR = 16000
 
-DATA_PATH = r"C:\Users\reemoon\Desktop\data_test\data_0830"
-LABEL_PATH = r"C:\Users\reemoon\Desktop\data_test\data_0830\label.csv"
+DATA_PATH = r"D:\model\data\durian\音频数据\data_all"
+LABEL_PATH = r"D:\model\data\durian\音频数据\data_all\label.csv"
 
 # 项目根目录(fqb), 输出目录相对它归档
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,7 +22,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #       请用 `train.config.RUN_TIME = ...` 的方式改写, 保证各子模块读到一致值。
 RUN_TIME = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "train", RUN_TIME)
-MODEL_PATH = os.path.join(OUTPUT_DIR, "model.pkl")
+MODEL_PATH = os.path.join(OUTPUT_DIR, "model_lgbm.pkl")
 VAL_RESULT_PATH = os.path.join(OUTPUT_DIR, "val_result.csv")
 
 # ================== 数据 ==================

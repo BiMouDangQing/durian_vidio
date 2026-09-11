@@ -11,7 +11,17 @@ import numpy as np
 import librosa
 
 _model = None
+_device = None
 _torch_failed = False
+
+
+def _get_device():
+    """检测并缓存设备: 有 CUDA 用 cuda, 否则回退 cpu。"""
+    global _device
+    if _device is None:
+        torch = _import_torch()
+        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return _device
 
 
 def _import_torch():
@@ -35,6 +45,7 @@ def _load_model():
         import torchvision.models as models
         _model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         _model.eval()
+        _model = _model.to(_get_device())
     return _model
 
 
@@ -50,12 +61,13 @@ def _preprocess(x, sr):
     img = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
     img = np.asarray(img, dtype=np.float32)
 
-    t = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    device = _get_device()
+    t = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,H,W)
     t = F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
     t = t.repeat(1, 3, 1, 1)  # 3 通道复制(RGB)
 
-    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=device).view(1, 3, 1, 1)
     return (t - mean) / std
 
 
@@ -73,7 +85,7 @@ def compute_deep_spectrum(x, sr):
     with torch.no_grad():
         model(t)
     handle.remove()
-    return activation["f"].flatten().numpy()  # (512,)
+    return activation["f"].flatten().cpu().numpy()  # (512,)
 
 
 def compute_feature_maps(x, sr, layer_name="layer3", n_channels=16):
