@@ -9,7 +9,7 @@ import pandas as pd
 import joblib
 import threading
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import QIODevice, QTimer, QThread, Qt, Signal, QSettings
 from PySide6.QtMultimedia import QAudioInput, QAudioFormat, QMediaDevices
 
@@ -681,6 +681,60 @@ class MainWindow(QtWidgets.QWidget):
             self.edit_pred_dir.setText(d)
             self.settings.setValue("predict/data_dir", d)
 
+    def _browse_single_file(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择单个敲击数据 CSV", "", "CSV (*.csv)")
+        if f:
+            self.edit_single_file.setText(f)
+
+    def _predict_single_file(self):
+        """预测单个 CSV 文件: 样本级 + 信号级。"""
+        path = self.edit_single_file.text().strip()
+        if not path:
+            f, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "选择敲击数据 CSV", "", "CSV (*.csv)")
+            if not f:
+                return
+            path = f
+            self.edit_single_file.setText(path)
+        if not os.path.isfile(path):
+            QtWidgets.QMessageBox.warning(self, "提示", "文件不存在")
+            return
+        try:
+            df = pd.read_csv(path, header=None)
+            arr = np.nan_to_num(df.values.astype(np.float64),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            arr = arr[np.any(arr != 0, axis=1)]
+            if arr.shape[0] == 0:
+                QtWidgets.QMessageBox.warning(self, "提示", "文件内没有有效信号")
+                return
+            knocks = []
+            for row in arr[:20]:
+                r = row[:1024] if len(row) >= 1024 else np.pad(row, (0, 1024 - len(row)))
+                knocks.append(np.asarray(r, dtype=np.float64))
+            pred = self._predict_knocks_value(knocks)
+            if pred is None:
+                self.lbl_pred.setText("预测: 无模型")
+                return
+            name = T.CLASS_NAMES.get(pred, str(pred))
+            self.lbl_pred.setText(f"预测: {name}({pred})")
+            # 信号级预测
+            rows = []
+            for i, x in enumerate(knocks):
+                sp = self._predict_knocks_value([x])
+                rows.append({"文件": os.path.basename(path),
+                             "信号序号": i + 1,
+                             "预测": sp if sp is not None else "-",
+                             "预测名称": T.CLASS_NAMES.get(sp, "-") if sp is not None else "-"})
+            txt = (f"单个文件预测: {os.path.basename(path)}\n"
+                   f"样本级预测: {name}({pred})\n\n")
+            self.txt_pred_result.setPlainText(
+                txt + pd.DataFrame(rows).to_string(index=False))
+        except Exception as e:
+            self.lbl_pred.setText(f"预测失败: {e}")
+
     def _predict_knocks_value(self, knocks):
         """对多条敲击信号预测, 返回类别 int(1/2/3), 失败返回 None。"""
         if not knocks:
@@ -792,9 +846,10 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 label_map = {}
 
-        # 按样本聚合信号
+        # 按样本聚合信号(同时记录每个文件的信号)
         from collections import defaultdict
         sample_knocks = defaultdict(list)
+        file_knocks = {}
         for f in files:
             sid = file_sid(f)
             try:
@@ -804,9 +859,12 @@ class MainWindow(QtWidgets.QWidget):
                 if arr.ndim == 1:
                     arr = arr.reshape(1, -1)
                 arr = arr[np.any(arr != 0, axis=1)]
+                knocks = []
                 for row in arr[:5]:   # 每文件最多 5 条信号
                     r = row[:1024] if len(row) >= 1024 else np.pad(row, (0, 1024 - len(row)))
-                    sample_knocks[sid].append(np.asarray(r, dtype=np.float64))
+                    knocks.append(np.asarray(r, dtype=np.float64))
+                sample_knocks[sid].extend(knocks)
+                file_knocks[f] = knocks
             except Exception:
                 pass
 
@@ -824,6 +882,7 @@ class MainWindow(QtWidgets.QWidget):
         sig_cls_correct = {c: 0 for c in class_names}
 
         rows = []
+        signal_rows = []
         sids_sorted = sorted(sample_knocks.keys())
         n_samples = len(sids_sorted)
         self.progress_predict.setValue(0)
@@ -841,26 +900,60 @@ class MainWindow(QtWidgets.QWidget):
                     mark = "√"
                 else:
                     mark = "×"
-            # 信号级: 每条敲击信号单独预测
-            if true is not None:
-                for x in knocks:
+            sample_label = sid if sid != 0 else "/".join(
+                os.path.splitext(f)[0] for f in files)
+            # 信号级: 遍历该样本每个文件的每条信号, 记录预测结果
+            for f, fknocks in file_knocks.items():
+                if file_sid(f) != sid:
+                    continue
+                for i, x in enumerate(fknocks):
                     sp = self._predict_knocks_value([x])
                     if sp is not None:
-                        sig_total += 1
-                        sig_cls_total[true] = sig_cls_total.get(true, 0) + 1
-                        if sp == true:
-                            sig_correct += 1
-                            sig_cls_correct[true] = sig_cls_correct.get(true, 0) + 1
-            rows.append({"样本": sid,
+                        signal_rows.append({
+                            "样本": sample_label,
+                            "文件": f,
+                            "信号序号": i + 1,
+                            "真实": true if true is not None else "-",
+                            "预测": sp,
+                            "预测名称": T.CLASS_NAMES.get(sp, str(sp)),
+                        })
+                        if true is not None:
+                            sig_total += 1
+                            sig_cls_total[true] = sig_cls_total.get(true, 0) + 1
+                            if sp == true:
+                                sig_correct += 1
+                                sig_cls_correct[true] = sig_cls_correct.get(true, 0) + 1
+            rows.append({"样本": sample_label,
                          "真实": true if true is not None else "-",
                          "预测": pred if pred is not None else "无法预测",
                          "预测名称": T.CLASS_NAMES.get(pred, "-") if pred else "-",
                          "正确": mark})
             self.progress_predict.setValue(int((idx + 1) / n_samples * 100))
-            QtWidgets.QCoreApplication.processEvents()
+            QtCore.QCoreApplication.processEvents()
+
+        # 文件级预测(每个文件的信号单独预测)
+        file_preds = []
+        for f in files:
+            knocks = file_knocks.get(f)
+            if knocks:
+                p = self._predict_knocks_value(knocks)
+                if p is not None:
+                    file_preds.append((f, p, T.CLASS_NAMES.get(p, str(p))))
 
         # 组装报告
         lines = ["========== 预测报告 =========="]
+        lines.append(f"预测目录: {dir_path}")
+        model_desc = getattr(self.loaded_model, "model_type", None)
+        if not model_desc:
+            model_desc = self.loaded_model_type or "自动"
+        lines.append(f"模型: {model_desc} | 时间: "
+                     f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if file_preds:
+            lines.append("")
+            lines.append("各文件预测:")
+            for f, p, pname in file_preds:
+                lines.append(f"  {f} -> {pname}({p})")
+        lines.append("")
         if sample_total:
             lines.append(f"样本级准确率: {sample_correct}/{sample_total} = {sample_correct/sample_total:.2%}")
             for c in sorted(class_names):
@@ -881,21 +974,38 @@ class MainWindow(QtWidgets.QWidget):
             df_res = pd.DataFrame(rows)
             report_text = "\n".join(lines) + "\n\n" + df_res.to_string(index=False)
             self.txt_pred_result.setPlainText(report_text)
-            # 保存预测结果到文档
+            # 保存所有结果到文档
             try:
                 out_dir = os.path.join(T.PROJECT_ROOT, "results", "predict",
                                        datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
                 os.makedirs(out_dir, exist_ok=True)
-                df_res.to_csv(os.path.join(out_dir, "predict_result.csv"),
+                # 信号级结果(主 CSV, 每条信号一行)
+                if signal_rows:
+                    pd.DataFrame(signal_rows).to_csv(
+                        os.path.join(out_dir, "predict_result.csv"),
+                        index=False, encoding="utf-8-sig")
+                # 样本级结果
+                df_res.to_csv(os.path.join(out_dir, "sample_result.csv"),
                               index=False, encoding="utf-8-sig")
                 with open(os.path.join(out_dir, "report.txt"), "w", encoding="utf-8") as fp:
                     fp.write(report_text)
-                self.txt_pred_result.appendPlainText(
-                    f"\n\n预测结果已保存到:\n{out_dir}\n  - predict_result.csv\n  - report.txt")
+                self.txt_pred_result.append(
+                    f"\n\n预测结果已保存到:\n{out_dir}\n"
+                    f"  - predict_result.csv ({len(signal_rows)} 条信号级结果)\n"
+                    f"  - sample_result.csv (样本级结果)\n"
+                    f"  - report.txt")
             except Exception as e:
-                self.txt_pred_result.appendPlainText(f"\n\n保存结果失败: {e}")
+                self.txt_pred_result.append(f"\n\n保存结果失败: {e}")
         else:
             self.txt_pred_result.setPlainText("\n".join(lines))
+
+        # 单样本预测: 醒目标注预测结果
+        if len(sample_knocks) == 1 and rows:
+            r = rows[0]
+            pred_val = r.get("预测")
+            if isinstance(pred_val, int):
+                self.lbl_pred.setText(f"预测: {T.CLASS_NAMES.get(pred_val, str(pred_val))}({pred_val})")
+            return
 
         if sample_total:
             head = f"样本级 {sample_correct/sample_total:.2%}"

@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
-"""深度学习训练: PANNs CNN14 迁移学习(三分类), GPU 加速。
+"""深度学习训练: PANNs CNN14/CNN10/ResNet18 迁移学习(三分类), GPU 加速。
 
 针对 64ms 短敲击信号(1024 点 @16kHz)做了适配:
-- 输入: mel 谱图 64 bins x 25 帧(n_fft=256, hop=32);
-- 网络: PANNs CNN14(AudioSet 预训练), 前 4 个卷积块只对频率维度池化(保持时间维度),
-        卷积核权重与预训练模型一致, 可加载官方 Cnn14_mAP=0.431 权重迁移;
-- 训练: 冻结低层 conv_block1-4, 微调 conv_block5-6 + fc1 + 分类头;
-- 评估: 按样本聚合(20 条信号概率平均 -> argmax), 复用 train.model 的分层划分与报告。
+- 输入: mel 谱图(按模型框架自动适配 bins 与时间分辨率);
+- 模型: PANNs CNN14/CNN10(AudioSet 预训练) 或 ResNet18(ImageNet 预训练);
+- 训练: 冻结底层, 微调高层 + 分类头; 数据增强(加噪 + SpecAugment + mixup);
+- 评估: 按样本聚合(概率平均 -> argmax), 复用 train.model 的分层划分与报告。
 
 运行:
     D:\\model\\model\\vidio\\.venv\\python.exe -m train.dl_train
-    (或: D:\\model\\model\\vidio\\.venv\\python.exe train\\dl_train.py)
 """
 
 import os
@@ -516,7 +514,7 @@ def main(progress_callback=None, pause_event=None):
     model.load_state_dict(torch.load(best_path, map_location=DEVICE))
     probs, g_va, y_va = predict_probs(model, va_loader)
     va_df = aggregate_probs(probs, g_va, y_va)
-    report(va_df, "深度学习模型(PANNs CNN14) 测试集样本级评估")
+    report(va_df, f"深度学习模型({MODEL_TYPE}) 测试集样本级评估")
     print(f"最佳模型已保存: {best_path} (样本级 acc {best_acc:.4f})")
     full_path = os.path.join(config.OUTPUT_DIR, f"model_{MODEL_TYPE}_full.pt")
     torch.save(model, full_path)

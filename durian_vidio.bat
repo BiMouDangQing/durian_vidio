@@ -8,7 +8,7 @@ set "PY=D:\model\model\vidio\.venv\pythonw.exe"
 
 if not exist "%PY%" (
     echo [ERROR] Python not found: %PY%
-    echo Please reinstall the conda env 'vidio_data' first.
+    echo Please check the Python path in the .venv folder.
     pause
     exit /b 1
 )

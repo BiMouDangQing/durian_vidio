@@ -358,7 +358,7 @@ class MainWindow(QtWidgets.QWidget):
                     self._images.append(png)
             else:
                 self._spec_log(f"  失败: {r['error']}")
-            QtWidgets.QCoreApplication.processEvents()
+            QtCore.QCoreApplication.processEvents()
 
         ok = sum(1 for r in results if r["ok"])
         self._spec_log(f"完成：成功 {ok}/{len(results)}")

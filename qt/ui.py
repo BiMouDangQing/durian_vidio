@@ -438,6 +438,18 @@ def build_ui(win: QtWidgets.QWidget):
     data_row.addWidget(win.btn_pred_dir)
     pred_layout.addLayout(data_row)
 
+    # 单个文件预测
+    single_row = QtWidgets.QHBoxLayout()
+    single_row.addWidget(QtWidgets.QLabel("单个文件:"))
+    win.edit_single_file = QtWidgets.QLineEdit()
+    win.edit_single_file.setPlaceholderText("选择单个 CSV 文件预测")
+    single_row.addWidget(win.edit_single_file, stretch=3)
+    win.btn_single_file = QtWidgets.QPushButton("浏览")
+    single_row.addWidget(win.btn_single_file)
+    win.btn_predict_single = QtWidgets.QPushButton("预测该文件")
+    single_row.addWidget(win.btn_predict_single)
+    pred_layout.addLayout(single_row)
+
     # 设备选择
     dev_row = QtWidgets.QHBoxLayout()
     win.chk_use_cpu = QtWidgets.QCheckBox("使用 CPU 预测(较慢, 用于 GPU 被占用时)")
@@ -490,6 +502,8 @@ def build_ui(win: QtWidgets.QWidget):
     win.btn_model_path.clicked.connect(win._load_model_file)
     win.btn_pred_dir.clicked.connect(win._browse_pred_dir)
     win.btn_predict.clicked.connect(win._predict_manual)
+    win.btn_single_file.clicked.connect(win._browse_single_file)
+    win.btn_predict_single.clicked.connect(win._predict_single_file)
     win.btn_preview.clicked.connect(win._browse_preview)
     win.btn_prev.clicked.connect(win._prev_preview)
     win.btn_next.clicked.connect(win._next_preview)
